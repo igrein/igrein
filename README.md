@@ -1,16 +1,21 @@
 ## Hi there 👋
 
-<!--
-**igrein/igrein** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+<# 
+Меня зовут Екатерина.  
 
-Here are some ideas to get you started:
+### 💻 Обо мне  
+- **C/C++ Developer** | **Python Developer**  
+- Алгоритмы | ООП | Data Analytics  
+- Изучаю: ML (курсы + BSA), продвинутый C++  
+- 🔥 Цель: Глубокое погружение в C++, Python и аналитику данных
+- 
+### 🦔 Fun Fact  
+Воспитываю ежа! Люблю совмещать хардкорные технологии с милыми моментами.
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
+### 📫 Контакты  
+- Telegram: [@igrein]  
+- Почта: igrein@mail.ru  
+### 📊 Статистика  
+[![Top Langs](https://github-readme-stats.vercel.app/api/top-langs/?username=igrein&layout=compact&hide=html,css&theme=radical)](https://github.com/igrein) 
+
 -->
