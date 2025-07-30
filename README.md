@@ -1,6 +1,5 @@
 ## Hi there 👋
 
-<# 
 Меня зовут Екатерина.  
 
 ### 💻 Обо мне  
@@ -18,4 +17,4 @@
 ### 📊 Статистика  
 [![Top Langs](https://github-readme-stats.vercel.app/api/top-langs/?username=igrein&layout=compact&hide=html,css&theme=radical)](https://github.com/igrein) 
 
--->
+
