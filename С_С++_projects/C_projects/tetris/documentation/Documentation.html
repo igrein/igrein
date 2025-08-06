@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Документация Tetris | Конечный автомат</title>
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            line-height: 1.6;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            color: #333;
+        }
+        h1, h2, h3 {
+            color: #2c3e50;
+            margin-top: 30px;
+        }
+        .game-image {
+            display: block;
+            max-width: 800px;
+            height: auto;
+            margin: 20px auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            background: white;
+        }
+        .figure-caption {
+            text-align: center;
+            font-style: italic;
+            color: #555;
+            margin-bottom: 30px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        ul.features {
+            columns: 2;
+            column-gap: 40px;
+        }
+    </style>
+</head>
+<body>
+    <h1>BrickGame Tetris - Документация</h1>
+
+    <section id="finite-state-machine">
+        <h2>Конечный автомат игры Tetris</h2>
+        
+        <div class="game-image">
+            <img src="tetris.png" alt="Диаграмма конечного автомата">
+            <p class="figure-caption">Рис. 1 - Диаграмма состояний и переходов</p>
+        </div>
+
+        <h3>Описание состояний:</h3>
+        <table>
+            <tr>
+                <th>Состояние</th>
+                <th>Описание</th>
+            </tr>
+            <tr>
+                <td><strong>Start</strong></td>
+                <td>Ожидание старта игры (экран приветствия)</td>
+            </tr>
+            <tr>
+                <td><strong>Spawn</strong></td>
+                <td>Генерация новой фигуры</td>
+            </tr>
+            <tr>
+                <td><strong>Move</strong></td>
+                <td>Обработка ввода игрока (движение/поворот)</td>
+            </tr>
+            <tr>
+                <td><strong>Shift</strong></td>
+                <td>Автоматическое падение фигуры вниз</td>
+            </tr>
+            <tr>
+                <td><strong>Attach</strong></td>
+                <td>Фиксация фигуры на поле + проверка линий</td>
+            </tr>
+            <tr>
+                <td><strong>GameOver</strong></td>
+                <td>Конец игры (достижение верха поля)</td>
+            </tr>
+        </table>
+
+        <h3>Переходы между состояниями:</h3>
+        <ul>
+            <li>Start → Spawn: при нажатии "Start"</li>
+            <li>Spawn → Move: после генерации фигуры</li>
+            <li>Move → Shift: по таймеру или вводу ↓</li>
+            <li>Shift → Attach: при столкновении с дном/фигурами</li>
+            <li>Attach → Spawn: если игра продолжается</li>
+            <li>Attach → GameOver: если новая фигура не помещается</li>
+        </ul>
+    </section>
+
+    <section id="scoring">
+        <h2>Система подсчета очков</h2>
+        <table>
+            <tr>
+                <th>Количество линий</th>
+                <th>Начисляемые очки</th>
+            </tr>
+            <tr>
+                <td>1</td>
+                <td>100</td>
+            </tr>
+            <tr>
+                <td>2</td>
+                <td>300</td>
+            </tr>
+            <tr>
+                <td>3</td>
+                <td>700</td>
+            </tr>
+            <tr>
+                <td>4</td>
+                <td>1500</td>
+            </tr>
+        </table>
+        
+        <h3>Система уровней:</h3>
+        <ul>
+            <li>Уровень повышается каждые <strong>600 очков</strong></li>
+            <li>Максимальный уровень: <strong>10</strong></li>
+            <li>Скорость падения фигур увеличивается с каждым уровнем</li>
+            <li>Рекорд сохраняется между запусками игры</li>
+        </ul>
+    </section>
+
+    <section id="controls">
+        <h2>Управление в игре</h2>
+        <table>
+            <tr>
+                <th>Клавиша</th>
+                <th>Действие</th>
+            </tr>
+            <tr>
+                <td>Стрелка влево (←)</td>
+                <td>Движение фигуры влево</td>
+            </tr>
+            <tr>
+                <td>Стрелка вправо (→)</td>
+                <td>Движение фигуры вправо</td>
+            </tr>
+            <tr>
+                <td>Стрелка вверх (↑)</td>
+                <td>Ничего</td>
+            </tr>
+            <tr>
+                <td>Стрелка вниз (↓)</td>
+                <td>Ускоренное падение (Hard drop)</td>
+            </tr>
+            <tr>
+                <td>Пробел</td>
+                <td>Поворот</td>
+            </tr>
+            <tr>
+                <td>P</td>
+                <td>Пауза</td>
+            </tr>
+            <tr>
+                <td>Q</td>
+                <td>Выход из игры</td>
+            </tr>
+        </table>
+    </section>
+
+    <section id="game-features">
+        <h2>Игровые особенности</h2>
+        <ul class="features">
+            <li>Классические правила Tetris</li>
+            <li>7 видов фигур-тетромино</li>
+            <li>Игровое поле 10×20</li>
+            <li>Показ следующей фигуры</li>
+            <li>Система подсчёта очков и уровней</li>
+            <li>Сохранение рекордов</li>
+            <li>Терминальный интерфейс (ncurses)</li>
+            <li>Реализация на языке C11</li>
+            <li>Покрытие тестами ≥80%</li>
+        </ul>
+    </section>
+</body>
+</html>
