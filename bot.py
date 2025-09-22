@@ -1,14 +1,20 @@
 import os
-import psycopg2
-from psycopg2 import pool
-from flask import Flask
+import asyncpg
+import httpx
+import json
+import base64
+import uuid
+import re
 import threading
+from flask import Flask
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 
-
+# Используем переменные окружения
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GIGACHAT_API_KEY = os.getenv('GIGACHAT_API_KEY')
 
-
+# Простой Flask для health check
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -20,22 +26,12 @@ def health():
     return "OK"
 
 def run_flask():
-    flask_app.run(host='0.0.0.0', port=5000, debug=False)
+    flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
-
-flask_thread = threading.Thread(target=run_flask, daemon=True)
-flask_thread.start()
-
-
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
-
-import asyncpg
-import httpx
-import json
-import base64
-import uuid
-import re
+# Запускаем Flask только если это главный файл
+if __name__ == '__main__':
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
 # Состояния для анкеты
 ASK_PET_NAME, ASK_BREED, ASK_AGE, ASK_WEIGHT, CONFIRM_PROFILE = range(5)
@@ -1932,6 +1928,5 @@ app.add_handler(CallbackQueryHandler(handle_hedgehog_selection_for_question, pat
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 
-if __name__ == '__main__':
-    print("Бот запущен...")
-    app.run_polling()
+print("Бот запущен...")
+app.run_polling()
