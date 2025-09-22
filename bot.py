@@ -1,5 +1,6 @@
 import os
-import asyncio
+import psycopg2
+from psycopg2 import pool
 from flask import Flask
 import threading
 
