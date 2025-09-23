@@ -520,8 +520,7 @@ async def confirm_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         breed = context.user_data['breed']
         age = context.user_data['age']
         weight = context.user_data['weight']
-        await save_user_to_db(user.id, user.username, user.first_name)
-        
+                
         conn = await get_db_connection()
         try:
             if 'editing_profile_id' in context.user_data:
