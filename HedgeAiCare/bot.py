@@ -1,13 +1,20 @@
 import os
-import asyncio
-from flask import Flask
+import asyncpg
+import httpx
+import json
+import base64
+import uuid
+import re
 import threading
+from flask import Flask
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 
-
+# Используем переменные окружения
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GIGACHAT_API_KEY = os.getenv('GIGACHAT_API_KEY')
 
-
+# Простой Flask для health check
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -19,22 +26,12 @@ def health():
     return "OK"
 
 def run_flask():
-    flask_app.run(host='0.0.0.0', port=5000, debug=False)
+    flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
-
-flask_thread = threading.Thread(target=run_flask, daemon=True)
-flask_thread.start()
-
-
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
-
-import asyncpg
-import httpx
-import json
-import base64
-import uuid
-import re
+# Запускаем Flask только если это главный файл
+if __name__ == '__main__':
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
 # Состояния для анкеты
 ASK_PET_NAME, ASK_BREED, ASK_AGE, ASK_WEIGHT, CONFIRM_PROFILE = range(5)
@@ -1846,25 +1843,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверяем, является ли сообщение кнопкой главного меню
     if text in all_menu_buttons:
+        await handle_main_menu(update, context)
         return
 
-    # 1. Обработка режима "Задать еще вопрос" после ответа
+    # Обработка вопроса с анкетой
+    if context.user_data.get('waiting_for_profile_question'):
+        await handle_profile_question_text(update, context)
+        return
+
+    # Обработка режима "Задать еще вопрос" после ответа
     if context.user_data.get('in_general_question_mode') and text == "❓ Задать еще вопрос":
         await ask_general_question(update, context)
         return
     
-    # 2. Обработка вопроса без анкеты
+    # Если ни одно из состояний не активно - предлагаем главное меню
+    await update.message.reply_text("Выберите действие из меню 👆", reply_markup=MAIN_MENU_MARKUP)
+
+async def handle_general_question_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ввода вопроса без анкеты (как у других кнопок)"""
     if context.user_data.get('waiting_for_general_question'):
         context.user_data['waiting_for_general_question'] = False
-        await handle_general_question(update, context, text)
-        return
-
-    # 3. Обработка заполнения анкеты
-    if any(key in context.user_data for key in ['pet_name', 'breed', 'age', 'weight', 'editing_field']):
-        return
-    
-    # 4. Если ни одно из состояний не активно - предлагаем главное меню
-    await update.message.reply_text("Выберите действие из меню 👆", reply_markup=MAIN_MENU_MARKUP)
+        question = update.message.text
+        await handle_general_question(update, context, question)
+    else:
+        await handle_message(update, context)
 
 app = Application.builder().token(TOKEN).build()
 
@@ -1912,6 +1914,11 @@ all_menu_buttons.append("⬅️ Вернуться в главное меню")
 
 app.add_handler(MessageHandler(filters.Text(all_menu_buttons), handle_main_menu))
 
+app.add_handler(MessageHandler(
+    filters.TEXT & ~filters.COMMAND, 
+    handle_general_question_input
+))
+
 app.add_handler(CallbackQueryHandler(handle_cancel_hedgehog_selection, pattern="^cancel_hedgehog_selection$"))
 app.add_handler(CallbackQueryHandler(handle_cancel_hedgehog_question, pattern="^cancel_hedgehog_question$"))
 app.add_handler(CallbackQueryHandler(handle_back_to_hedgehog_selection, pattern="^back_to_hedgehog_selection$"))
@@ -1931,6 +1938,5 @@ app.add_handler(CallbackQueryHandler(handle_hedgehog_selection_for_question, pat
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 
-if __name__ == '__main__':
-    print("Бот запущен...")
-    app.run_polling()
+print("Бот запущен...")
+app.run_polling()
