@@ -1843,25 +1843,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверяем, является ли сообщение кнопкой главного меню
     if text in all_menu_buttons:
+        await handle_main_menu(update, context)
         return
 
-    # 1. Обработка режима "Задать еще вопрос" после ответа
+    # Обработка вопроса с анкетой
+    if context.user_data.get('waiting_for_profile_question'):
+        await handle_profile_question_text(update, context)
+        return
+
+    # Обработка режима "Задать еще вопрос" после ответа
     if context.user_data.get('in_general_question_mode') and text == "❓ Задать еще вопрос":
         await ask_general_question(update, context)
         return
     
-    # 2. Обработка вопроса без анкеты
+    # Если ни одно из состояний не активно - предлагаем главное меню
+    await update.message.reply_text("Выберите действие из меню 👆", reply_markup=MAIN_MENU_MARKUP)
+
+async def handle_general_question_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ввода вопроса без анкеты (как у других кнопок)"""
     if context.user_data.get('waiting_for_general_question'):
         context.user_data['waiting_for_general_question'] = False
-        await handle_general_question(update, context, text)
-        return
-
-    # 3. Обработка заполнения анкеты
-    if any(key in context.user_data for key in ['pet_name', 'breed', 'age', 'weight', 'editing_field']):
-        return
-    
-    # 4. Если ни одно из состояний не активно - предлагаем главное меню
-    await update.message.reply_text("Выберите действие из меню 👆", reply_markup=MAIN_MENU_MARKUP)
+        question = update.message.text
+        await handle_general_question(update, context, question)
+    else:
+        await handle_message(update, context)
 
 app = Application.builder().token(TOKEN).build()
 
@@ -1908,6 +1913,11 @@ for row in MAIN_MENU_KEYBOARD:
 all_menu_buttons.append("⬅️ Вернуться в главное меню")
 
 app.add_handler(MessageHandler(filters.Text(all_menu_buttons), handle_main_menu))
+
+app.add_handler(MessageHandler(
+    filters.TEXT & ~filters.COMMAND, 
+    handle_general_question_input
+))
 
 app.add_handler(CallbackQueryHandler(handle_cancel_hedgehog_selection, pattern="^cancel_hedgehog_selection$"))
 app.add_handler(CallbackQueryHandler(handle_cancel_hedgehog_question, pattern="^cancel_hedgehog_question$"))
