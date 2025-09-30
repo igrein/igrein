@@ -187,15 +187,55 @@ CONTINUE_QUESTION_MARKUP = ReplyKeyboardMarkup(CONTINUE_QUESTION_KEYBOARD, resiz
 
 #НОВОЕ
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot_debug.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger('HedgehogBot')
+# НАСТРОЙКА ЛОГИРОВАНИЯ - ИСПРАВЛЕННАЯ ВЕРСИЯ
+import logging
+import sys
+from datetime import datetime
+
+def setup_logging():
+    """Настройка логирования с созданием логгера"""
+    logger = logging.getLogger('HedgehogBot')
+    logger.setLevel(logging.INFO)
+    
+    # Если уже есть обработчики - очищаем
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # Форматтер
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Файловый обработчик
+    try:
+        file_handler = logging.FileHandler('bot_debug.log', encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        print("✓ File handler created successfully")
+    except Exception as e:
+        print(f"✗ File handler error: {e}")
+    
+    # Консольный обработчик
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # Предотвращаем дублирование сообщений
+    logger.propagate = False
+    
+    return logger
+
+# Инициализация логгера
+logger = setup_logging()
+logger.info("=== Logging initialized successfully ===")
+
+# Принудительно создаем и тестируем лог-файл
+try:
+    with open('bot_debug.log', 'a', encoding='utf-8') as f:
+        f.write(f"\n{'='*50}\n")
+        f.write(f"Bot started at: {datetime.now()}\n")
+        f.write(f"{'='*50}\n")
+    logger.info("✓ Log file created and tested successfully")
+except Exception as e:
+    logger.error(f"✗ Cannot create log file: {e}")
 
 # Дополнительная функция для логирования ошибок БД
 async def log_db_error(user_id, operation, error):
