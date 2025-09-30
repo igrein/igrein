@@ -1,4 +1,8 @@
 import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncpg
 import httpx
 import json
@@ -181,6 +185,7 @@ CONTINUE_QUESTION_MARKUP = ReplyKeyboardMarkup(CONTINUE_QUESTION_KEYBOARD, resiz
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start. Показывает главное меню."""
     user = update.effective_user
+    await save_user_to_db(user.id, user.username, user.first_name)
     welcome_text = (
         f"👋 Привет, {user.first_name}!\n\n"
         "Добро пожаловать в HedgeAiCare — умную заботу о колючем друге 🦔\n\n"
@@ -515,7 +520,7 @@ async def confirm_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         breed = context.user_data['breed']
         age = context.user_data['age']
         weight = context.user_data['weight']
-        
+                
         conn = await get_db_connection()
         try:
             if 'editing_profile_id' in context.user_data:
