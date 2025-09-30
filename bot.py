@@ -14,7 +14,6 @@ from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 
-#НОВОЕ
 import logging
 import sys
 from datetime import datetime
@@ -185,13 +184,7 @@ CONTINUE_QUESTION_KEYBOARD = [
 ]
 CONTINUE_QUESTION_MARKUP = ReplyKeyboardMarkup(CONTINUE_QUESTION_KEYBOARD, resize_keyboard=True, one_time_keyboard=True)
 
-#НОВОЕ
 # Настройка логирования
-# НАСТРОЙКА ЛОГИРОВАНИЯ - ИСПРАВЛЕННАЯ ВЕРСИЯ
-import logging
-import sys
-from datetime import datetime
-
 def setup_logging():
     """Настройка логирования с созданием логгера"""
     logger = logging.getLogger('HedgehogBot')
@@ -245,8 +238,6 @@ async def log_db_error(user_id, operation, error):
 async def log_success(user_id, operation, details=""):
     logger.info(f"Success - User: {user_id}, Operation: {operation}, Details: {details}")
 
-
-#NEW
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start. Показывает главное меню."""
     user = update.effective_user
@@ -801,9 +792,8 @@ async def cancel_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 #БАЗА ДАННЫХ
 
-#НОВОЕ
 async def save_user_to_db(user_id, username, first_name):
-    """Сохраняет пользователя в таблицу Users с обработкой ошибок"""
+    """Сохраняет пользователя в таблицу Users с обработкой отсутствующего username"""
     logger.info(f"Attempting to save user to DB: {user_id}, {username}, {first_name}")
     
     max_retries = 3
@@ -813,9 +803,13 @@ async def save_user_to_db(user_id, username, first_name):
         try:
             conn = await get_db_connection()
             try:
+                # Если username None, используем пустую строку и значение по умолчанию
+                safe_username = username if username is not None else ""
+                safe_first_name = first_name if first_name is not None else "Пользователь"
+                
                 await conn.execute(
                     "INSERT INTO Users (user_id, user_name, first_name) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING",
-                    user_id, username, first_name
+                    user_id, safe_username, safe_first_name
                 )
                 await log_success(user_id, "save_user", f"Attempt {attempt + 1}")
                 logger.info(f"User {user_id} successfully saved to database")
@@ -889,9 +883,6 @@ async def check_db_connection():
     except Exception as e:
         logger.error(f"Database connection check: FAILED - {e}")
         return False
-
-# Запускайте эту проверку периодически или при старте
-
 
 #КНОПКА Анкеты ежей и функции к ее логике
 async def go_to_my_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2093,7 +2084,7 @@ app.add_handler(MessageHandler(
     handle_general_question_input
 ))
 
-# Добавьте это после создания app
+
 app.add_error_handler(error_handler)
 
 app.add_handler(CallbackQueryHandler(handle_cancel_hedgehog_selection, pattern="^cancel_hedgehog_selection$"))
