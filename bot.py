@@ -14,6 +14,11 @@ from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 
+#НОВОЕ
+import logging
+import sys
+from datetime import datetime
+
 # Используем переменные окружения
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 GIGACHAT_API_KEY = os.getenv('GIGACHAT_API_KEY')
@@ -180,24 +185,71 @@ CONTINUE_QUESTION_KEYBOARD = [
 ]
 CONTINUE_QUESTION_MARKUP = ReplyKeyboardMarkup(CONTINUE_QUESTION_KEYBOARD, resize_keyboard=True, one_time_keyboard=True)
 
+#НОВОЕ
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot_debug.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('HedgehogBot')
+
+# Дополнительная функция для логирования ошибок БД
+async def log_db_error(user_id, operation, error):
+    logger.error(f"DB Error - User: {user_id}, Operation: {operation}, Error: {error}")
+
+# Дополнительная функция для логирования успешных операций
+async def log_success(user_id, operation, details=""):
+    logger.info(f"Success - User: {user_id}, Operation: {operation}, Details: {details}")
 
 
+#NEW
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start. Показывает главное меню."""
     user = update.effective_user
-    await save_user_to_db(user.id, user.username, user.first_name)
-    welcome_text = (
-        f"👋 Привет, {user.first_name}!\n\n"
-        "Добро пожаловать в HedgeAiCare — умную заботу о колючем друге 🦔\n\n"
-        "🔎 Я могу:\n"
-        "• Ответить на вопросы о содержании, питании и гигиене ежей\n"
-        "• Учитывать особенности именно вашего питомца, если заполните анкету\n\n"
-        "⚠️ Важно: мои советы носят справочный характер и не заменяют консультацию ветеринара-ратолога.\n\n"
-        "Выберите, с чего хотите начать заботу о вашем ежике, в меню ниже ⬇️"
-    )
-    # Очистка конктеста при новом старте
-    context.user_data.clear()
-    await update.message.reply_text(welcome_text, reply_markup=MAIN_MENU_MARKUP)
+    logger.info(f"Start command received from user: {user.id}, {user.username}, {user.first_name}")
+    
+    try:
+        # Пытаемся сохранить пользователя, но не блокируем весь процесс при ошибке
+        save_success = await save_user_to_db(user.id, user.username, user.first_name)
+        
+        if not save_success:
+            logger.warning(f"Failed to save user {user.id} to DB, but continuing with start flow")
+        
+        welcome_text = (
+            f"👋 Привет, {user.first_name}!\n\n"
+            "Добро пожаловать в HedgeAiCare — умную заботу о колючем друге 🦔\n\n"
+            "🔎 Я могу:\n"
+            "• Ответить на вопросы о содержании, питании и гигиене ежей\n"
+            "• Учитывать особенности именно вашего питомца, если заполните анкету\n\n"
+            "⚠️ Важно: мои советы носят справочный характер и не заменяют консультацию ветеринара-ратолога.\n\n"
+            "Выберите, с чего хотите начать заботу о вашем ежике, в меню ниже ⬇️"
+        )
+        
+        # Очистка контекста при новом старте
+        context.user_data.clear()
+        
+        await update.message.reply_text(welcome_text, reply_markup=MAIN_MENU_MARKUP)
+        logger.info(f"Start message successfully sent to user {user.id}")
+        
+    except Exception as e:
+        logger.error(f"Critical error in start handler for user {user.id}: {str(e)}")
+        # Даже при ошибке пытаемся отправить сообщение
+        try:
+            emergency_text = (
+                f"👋 Привет, {user.first_name}!\n\n"
+                "Добро пожаловать в HedgeAiCare — умную заботу о колючем друге 🦔\n\n"
+                "Произошла временная техническая ошибка, но вы можете продолжить работу.\n\n"
+                "Выберите действие в меню ниже ⬇️"
+            )
+            await update.message.reply_text(emergency_text, reply_markup=MAIN_MENU_MARKUP)
+        except Exception as inner_e:
+            logger.critical(f"Complete failure for user {user.id}: {str(inner_e)}")
+
+
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Центральный обработчик для кнопок главного меню."""
@@ -708,20 +760,97 @@ async def cancel_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 #БАЗА ДАННЫХ
+
+#НОВОЕ
 async def save_user_to_db(user_id, username, first_name):
-    """Сохраняет пользователя в таблицу Users"""
-    conn = await get_db_connection()
-    try:
-        await conn.execute(
-            "INSERT INTO Users (user_id, user_name, first_name) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING",
-            user_id, username, first_name
-        )
-    finally:
-        await conn.close()
+    """Сохраняет пользователя в таблицу Users с обработкой ошибок"""
+    logger.info(f"Attempting to save user to DB: {user_id}, {username}, {first_name}")
+    
+    max_retries = 3
+    retry_delay = 2  # секунды
+    
+    for attempt in range(max_retries):
+        try:
+            conn = await get_db_connection()
+            try:
+                await conn.execute(
+                    "INSERT INTO Users (user_id, user_name, first_name) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING",
+                    user_id, username, first_name
+                )
+                await log_success(user_id, "save_user", f"Attempt {attempt + 1}")
+                logger.info(f"User {user_id} successfully saved to database")
+                return True
+                
+            except Exception as e:
+                await log_db_error(user_id, "save_user", f"Attempt {attempt + 1}: {str(e)}")
+                logger.error(f"Database error while saving user {user_id}: {str(e)}")
+                raise
+                
+            finally:
+                await conn.close()
+                
+        except asyncpg.exceptions.ConnectionDoesNotExistError:
+            logger.warning(f"Connection error attempt {attempt + 1} for user {user_id}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error(f"Failed to save user {user_id} after {max_retries} attempts")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Unexpected error saving user {user_id}: {str(e)}")
+            return False
+    
+    return False
 
 async def get_db_connection():
-    """Создает подключение к базе данных"""
-    return await asyncpg.connect(**DB_CONFIG)
+    """Создает подключение к базе данных с таймаутом и логированием"""
+    logger.info("Attempting to create database connection")
+    
+    try:
+        # Добавляем таймаут подключения
+        conn = await asyncpg.connect(
+            **DB_CONFIG,
+            timeout=30.0  # 30 секунд таймаут
+        )
+        logger.info("Database connection established successfully")
+        return conn
+        
+    except Exception as e:
+        logger.error(f"Failed to establish database connection: {str(e)}")
+        raise
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный обработчик ошибок"""
+    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+    
+    # Логируем детали update
+    if update and update.effective_user:
+        logger.error(f"Error for user: {update.effective_user.id}")
+    
+    # Можно отправить сообщение администратору или пользователю
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "😔 Произошла техническая ошибка. Пожалуйста, попробуйте еще раз."
+            )
+    except Exception as e:
+        logger.error(f"Failed to send error message: {e}")
+
+async def check_db_connection():
+    """Проверяет доступность базы данных"""
+    try:
+        conn = await get_db_connection()
+        await conn.close()
+        logger.info("Database connection check: SUCCESS")
+        return True
+    except Exception as e:
+        logger.error(f"Database connection check: FAILED - {e}")
+        return False
+
+# Запускайте эту проверку периодически или при старте
 
 
 #КНОПКА Анкеты ежей и функции к ее логике
@@ -1923,6 +2052,9 @@ app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND, 
     handle_general_question_input
 ))
+
+# Добавьте это после создания app
+app.add_error_handler(error_handler)
 
 app.add_handler(CallbackQueryHandler(handle_cancel_hedgehog_selection, pattern="^cancel_hedgehog_selection$"))
 app.add_handler(CallbackQueryHandler(handle_cancel_hedgehog_question, pattern="^cancel_hedgehog_question$"))
