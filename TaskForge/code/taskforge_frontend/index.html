@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TaskForge AI — Генератор вариантов заданий</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Шапка -->
+        <header>
+            <div class="logo">
+                <h1>⚡ TaskForge AI</h1>
+                <p class="slogan">Один эталон — десять вариантов. Без потери сложности.</p>
+            </div>
+            <div class="session-info">
+                <span>🔑 Сессия: <span id="sessionIdDisplay">...</span></span>
+                <span>📊 Лимит: <span id="rateLimitDisplay">30</span> запросов/час</span>
+                <button id="newSessionBtn" class="btn-small">🔄 Новая сессия</button>
+            </div>
+        </header>
+
+        <!-- Основной контент -->
+        <main>
+            <!-- Шаг 1: Загрузка задания -->
+            <section class="card step-card" id="step1">
+                <h2>📄 Шаг 1: Загрузите эталонное задание</h2>
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">📁</div>
+                    <p>Перетащите файл сюда или кликните для выбора</p>
+                    <p class="upload-hint">Поддерживаемые форматы: TXT, PDF, DOCX, PNG, JPG</p>
+                    <input type="file" id="fileInput" accept=".txt,.pdf,.docx,.png,.jpg,.jpeg" hidden>
+                    <button id="selectFileBtn" class="btn">Выбрать файл</button>
+                </div>
+                <div class="or-divider">или</div>
+                <div class="text-input-area">
+                    <textarea id="manualText" placeholder="Или вставьте текст задания сюда..."></textarea>
+                </div>
+                <button id="continueToSettingsBtn" class="btn-primary" style="margin-top: 20px;">Продолжить →</button>
+            </section>
+
+            <!-- Шаг 2: Настройки генерации -->
+            <section class="card step-card" id="step2" style="display: none;">
+                <h2>⚙️ Шаг 2: Настройте параметры</h2>
+                
+                <div class="settings-grid">
+                    <div class="setting">
+                        <label>Количество вариантов (2-10):</label>
+                        <input type="number" id="numVariants" min="2" max="10" value="4">
+                    </div>
+                    
+                    <div class="setting">
+                        <label>Типы вариаций:</label>
+                        <div class="checkbox-group">
+                            <label><input type="checkbox" value="numbers" checked> 🔢 Числовые данные</label>
+                            <label><input type="checkbox" value="order" checked> 🔄 Порядок условий</label>
+                            <label><input type="checkbox" value="synonyms"> 📝 Синонимы</label>
+                            <label><input type="checkbox" value="context"> 🌍 Контекст</label>
+                        </div>
+                    </div>
+                    
+                    <div class="setting">
+                        <label>🎯 Уровень сложности:</label>
+                        <div class="difficulty-buttons">
+                            <label class="difficulty-option">
+                                <input type="radio" name="difficulty" value="easier"> 📉 Проще
+                            </label>
+                            <label class="difficulty-option">
+                                <input type="radio" name="difficulty" value="same" checked> 📊 Так же
+                            </label>
+                            <label class="difficulty-option">
+                                <input type="radio" name="difficulty" value="harder"> 📈 Сложнее
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <!-- Целевой класс -->
+                    <div class="setting">
+                        <label>🎓 Целевой класс (опционально):</label>
+                        <select id="targetGrade">
+                            <option value="">Автоопределение</option>
+                            <option value="5">5 класс</option>
+                            <option value="6">6 класс</option>
+                            <option value="7">7 класс</option>
+                            <option value="8">8 класс</option>
+                            <option value="9">9 класс</option>
+                            <option value="10">10 класс</option>
+                            <option value="11">11 класс</option>
+                        </select>
+                    </div>
+                    
+                    <div class="setting">
+                        <label>Пресеты:</label>
+                        <div class="preset-buttons">
+                            <button type="button" class="preset-btn" data-preset="minimal">📝 Минимальный</button>
+                            <button type="button" class="preset-btn" data-preset="standard">⭐ Стандартный</button>
+                            <button type="button" class="preset-btn" data-preset="full">🚀 Полный</button>
+                        </div>
+                    </div>
+                    
+                    <div class="setting">
+                        <label>Запретить изменение (опционально):</label>
+                        <input type="text" id="forbiddenParts" placeholder="Например: имя 'Мария', город 'Москва'">
+                    </div>
+                </div>
+                
+                <button id="generateBtn" class="btn btn-primary">🚀 Сгенерировать варианты</button>
+                <button id="backToUploadBtn" class="btn-secondary" style="margin-left: 10px;">← Назад</button>
+            </section>
+
+            <!-- Шаг 3: Анализ структуры  -->
+            <section class="card step-card" id="stepAnalysis" style="display: none;">
+                <h2>🔍 Анализ структуры задания</h2>
+                <div id="structureAnalysisContainer" class="structure-analysis"></div>
+                <div class="navigation-buttons">
+                    <button id="backToSettingsFromAnalysisBtn" class="btn-secondary">← Назад к настройкам</button>
+                    <button id="proceedToGenerateBtn" class="btn-primary">Продолжить генерацию →</button>
+                </div>
+            </section>
+
+            <!-- Шаг 4: Результаты генерации -->
+            <section class="card step-card" id="step3" style="display: none;">
+                <h2>📋 Результаты генерации</h2>
+                
+                <!-- Анализ сложности -->
+                <div class="difficulty-analysis" id="difficultyAnalysis"></div>
+                
+                <!-- Валидация и ответы -->
+                <div class="validation-section" id="validationSection" style="display: none;">
+                    <h3>✅ Проверка вариантов</h3>
+                    <div id="validationResult" class="validation-result"></div>
+                    <div id="answersSection" class="answers-section" style="display: none;">
+                        <h4>📝 Ответы для учителя</h4>
+                        <div id="answersContainer" class="answers-container"></div>
+                    </div>
+                </div>
+                
+                <div class="variants-toolbar">
+                    <button id="exportPdfBtn" class="btn-small">📄 Экспорт PDF</button>
+                    <button id="exportDocxBtn" class="btn-small">📝 Экспорт DOCX</button>
+                </div>
+                
+                <div class="variants-container" id="variantsContainer"></div>
+                
+                <div class="navigation-buttons">
+                    <button id="backToAnalysisBtn" class="btn-secondary">← Назад к анализу</button>
+                    <button id="newTaskBtn" class="btn">➕ Новое задание</button>
+                </div>
+            </section>
+
+            <!-- Шаг 5: Библиотека заданий -->
+            <section class="card step-card" id="step4" style="display: none;">
+                <h2>📚 Библиотека заданий</h2>
+                <div id="historyContainer" class="history-grid"></div>
+                <button id="backToGeneratorBtn" class="btn-secondary">← Назад к генератору</button>
+            </section>
+        </main>
+
+        <!-- Футер с навигацией -->
+        <footer>
+            <div class="nav-links">
+                <button class="nav-btn" data-step="1">📝 Новое задание</button>
+                <button class="nav-btn" data-step="4">📚 Библиотека</button>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Модальное окно для редактирования -->
+    <div id="editModal" class="modal" style="display: none;" role="dialog" aria-modal="true" aria-label="Редактирование варианта">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h3>Редактировать вариант</h3>
+            <textarea id="editTextarea" rows="15"></textarea>
+            <div class="modal-buttons">
+                <button id="saveEditBtn" class="btn-primary">Сохранить</button>
+                <button id="regenerateVariantBtn" class="btn-secondary">🔄 Перегенерировать</button>
+                <button id="cancelEditBtn" class="btn">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+        <div class="spinner"></div>
+        <p id="loadingMessage">Генерация вариантов...</p>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script src="js/ui.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
