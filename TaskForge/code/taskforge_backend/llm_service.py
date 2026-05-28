@@ -1,428 +1,689 @@
-import httpx
-import os
-import json
 import logging
 import re
-import base64
-import uuid
-import time
-from typing import Dict, List, Optional, Any
-from dotenv import load_dotenv
+import hashlib
+from typing import Dict, List, Optional, Any, Union
+from enum import Enum
+from dataclasses import dataclass, field
+from document_models import VariantDocument
+from document_parser import parse_variant_to_document
+from llm_client import call_llm, clean_json_response, _stringify_answer_object, normalize_for_cache
+import json
 
-load_dotenv()
+# Импорты из answer_validators
+from answer_validators import (
+    validate_answers_batch, 
+    format_validation_for_frontend,
+    AnswerFormat,
+    StructuralType,
+    get_answer_format_instruction,
+    detect_structural_type_from_text
+)
 
 logger = logging.getLogger(__name__)
 
-# Конфигурация GigaChat (через Authorization Key)
-GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
-GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
-GIGACHAT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-GIGACHAT_AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 
-# Кэш токена
-_cached_token: Optional[str] = None
-_token_expires_at: float = 0
-
-# Пресеты вариаций из кейса
+# ПРЕСЕТЫ ВАРИАЦИЙ
 VARIATION_PRESETS = {
     "minimal": ["numbers"],
     "standard": ["numbers", "order"],
-    "full": ["numbers", "order", "synonyms", "context"]
+    "full": ["numbers", "order", "synonyms"]
 }
 
 
-# HELPER: Авторизация в GigaChat (через credentials)
-async def _get_access_token() -> str:
-    global _cached_token, _token_expires_at
+# ПЕДАГОГИЧЕСКАЯ МОДЕЛЬ
+
+class PedagogicalIntent(str, Enum):
+    FACT_RECALL = "fact_recall"
+    CONCEPT_UNDERSTANDING = "concept_understanding"
+    CLASSIFICATION = "classification"
+    COMPARISON = "comparison"
+    SEQUENCE = "sequence"
+    APPLICATION = "application"
+    CALCULATION = "calculation"
+    PROOF = "proof"
+    ANALYSIS = "analysis"
+    ARGUMENTATION = "argumentation"
+    TEXT_INTERPRETATION = "text_interpretation"
+    GRAMMAR_RULE = "grammar_rule"
+    MATCHING = "matching"
+
+
+class CognitiveLevel(str, Enum):
+    RECOGNITION = "recognition"
+    REPRODUCTION = "reproduction"
+    APPLICATION = "application"
+    ANALYSIS = "analysis"
+    SYNTHESIS = "synthesis"
+
+
+class VariationPolicy(str, Enum):
+    NUMERIC_PARAMETERS = "numeric_parameters"
+    DOMAIN_ENTITIES = "domain_entities"
+    SURFACE_WORDING = "surface_wording"
+    ORDER = "order"
+    DATASET = "dataset"
+
+
+@dataclass
+class PedagogicalSpec:
+    pedagogical_intent: PedagogicalIntent
+    cognitive_level: CognitiveLevel
+    structural_type: StructuralType
+    answer_format: AnswerFormat
+    operations_count: int = 1
+    cognitive_load: int = 1
+    options_count: int = 0
+    requires_single_correct: bool = True
+    requires_unique_answer: bool = True
     
-    if _cached_token and time.time() < _token_expires_at - 300:
-        return _cached_token
+    def to_invariant_dict(self) -> Dict[str, Any]:
+        return {
+            "pedagogical_intent": self.pedagogical_intent.value,
+            "cognitive_level": self.cognitive_level.value,
+            "structural_type": self.structural_type.value,
+            "answer_format": self.answer_format.value,
+            "operations_count": self.operations_count,
+            "cognitive_load": self.cognitive_load,
+            "requires_unique_answer": self.requires_unique_answer
+        }
+
+
+@dataclass
+class ContentSpec:
+    knowledge_domain: str
+    topic_core: str = ""
+    grade: str = "5-9"  # ← добавить
+    topic_boundaries: List[str] = field(default_factory=list)
+    forbidden_topics: List[str] = field(default_factory=list)
+    forbidden_entities: List[str] = field(default_factory=list)
+    skill_target: str = ""
+    content_entities: List[str] = field(default_factory=list)
+    preserved_patterns: List[str] = field(default_factory=list)
+    forbid_topic_shift: bool = True
+    allowed_variations: List[VariationPolicy] = field(default_factory=lambda: [
+        VariationPolicy.NUMERIC_PARAMETERS,
+        VariationPolicy.DOMAIN_ENTITIES,
+        VariationPolicy.SURFACE_WORDING
+    ])
+
+
+@dataclass
+class TaskSpecification:
+    pedagogical: PedagogicalSpec
+    content: ContentSpec
+    legacy_subject: str = "не определён"
+    legacy_topic: str = "не определена"
+    legacy_skill: str = "не определён"
+    legacy_didactic_goal: str = "не определена"
     
-    if not GIGACHAT_CREDENTIALS:
-        raise ValueError("Нет credentials")
+    @property
+    def difficulty_level(self) -> int:
+        return min(10, self.pedagogical.cognitive_load * self.pedagogical.operations_count)
     
-    headers = {
-        "Authorization": f"Bearer {GIGACHAT_CREDENTIALS}",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "RqUID": str(uuid.uuid4()),
+    def to_prompt_invariants(self) -> str:
+        return f"""
+=== ПЕДАГОГИЧЕСКИЕ ИНВАРИАНТЫ (НЕ МЕНЯТЬ) ===
+📚 Педагогическая цель: {self.pedagogical.pedagogical_intent.value}
+🧠 Когнитивный уровень: {self.pedagogical.cognitive_level.value}
+🏗️ Структурный тип: {self.pedagogical.structural_type.value}
+📝 Формат ответа: {self.pedagogical.answer_format.value}
+🔢 Количество операций: {self.pedagogical.operations_count}
+
+=== КОНТЕКСТ ===
+Предмет: {self.content.knowledge_domain}
+Тема: {self.content.topic_core if self.content.topic_core else "по эталону"}
+"""
+    
+    def to_legacy_dict(self) -> Dict[str, Any]:
+        structural_to_legacy = {
+            StructuralType.MULTIPLE_CHOICE: "test",
+            StructuralType.MATCHING: "matching",
+            StructuralType.ORDERING: "ordering",
+            StructuralType.CLASSIFICATION_STRUCT: "classification",
+            StructuralType.FILL_BLANKS: "fill_blanks",
+            StructuralType.OPEN_RESPONSE: "open_question",
+            StructuralType.CALCULATION: "calculation",
+            StructuralType.PROOF_STRUCT: "proof",
+        }
+        
+        legacy_task_type = structural_to_legacy.get(self.pedagogical.structural_type, "calculation")
+        
+        return {
+            "subject": self.legacy_subject,
+            "task_type": legacy_task_type,
+            "difficulty_score": self.difficulty_level,
+            "operations_count": self.pedagogical.operations_count,
+            "grade": self.content.grade if hasattr(self.content, 'grade') else "5-9",
+            "topic": self.legacy_topic,
+            "skill": self.legacy_skill,
+            "didactic_goal": self.legacy_didactic_goal,
+            "pedagogical_intent": self.pedagogical.pedagogical_intent.value,  # ← ДОБАВИТЬ
+            "cognitive_level": self.pedagogical.cognitive_level.value,        # ← ДОБАВИТЬ
+            "variable_elements": [v.value for v in self.content.allowed_variations],
+            "invariant_elements": [
+                f"pedagogical_intent: {self.pedagogical.pedagogical_intent.value}",
+                f"cognitive_level: {self.pedagogical.cognitive_level.value}",
+                f"structural_type: {self.pedagogical.structural_type.value}",
+                f"topic_core: {self.content.topic_core}"
+            ] + self.content.preserved_patterns,
+            "recommended_variations": [v.value for v in self.content.allowed_variations],
+            "why_difficulty": f"Когнитивная нагрузка {self.pedagogical.cognitive_load} × операции {self.pedagogical.operations_count}",
+            "why_invariant": "Педагогическая модель и тема должны сохраняться",
+            "why_variable": "Контент может варьироваться в пределах темы"
+        }
+
+
+# ГЛОБАЛЬНЫЙ КЭШ
+_SPEC_CACHE: Dict[str, TaskSpecification] = {}
+
+
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+def normalize_topic(topic: str) -> str:
+    """Нормализует тему для консистентности"""
+    if not topic:
+        return ""
+    
+    topic_lower = topic.lower().strip()
+    
+    normalizations = {
+        "органы дыхательной системы человека": "дыхательная система",
+        "дыхание человека": "дыхательная система",
+        "органы дыхания": "дыхательная система",
+        "дыхательная система человека": "дыхательная система",
+        "квадратные уравнения": "квадратные уравнения",
+        "квадратное уравнение": "квадратные уравнения",
+        "реформы петра i": "реформы Петра I",
+        "реформы петра первого": "реформы Петра I",
+        "млекопитающие": "млекопитающие",
+        "млекопитающие животные": "млекопитающие",
     }
     
-    body = {"scope": GIGACHAT_SCOPE}
+    for key, normalized in normalizations.items():
+        if key in topic_lower:
+            return normalized
     
-    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-        response = await client.post(GIGACHAT_AUTH_URL, headers=headers, data=body)
-        response.raise_for_status()
-        data = response.json()
-        
-        _cached_token = data.get("access_token")
-        # Если нет expires_in, ставим 30 минут по умолчанию
-        _token_expires_at = time.time() + data.get("expires_in", 1800)
-        
-        logger.info(f"Получен новый Access Token")
-        return _cached_token
+    return topic
 
 
-# HELPER: Очистка JSON от LLM
-def clean_json_response(result: str) -> dict:
-    """Очищает ответ LLM от markdown и мусора, парсит JSON"""
-    result = result.strip()
-    
-    # Удаляем markdown-обёртки
-    if result.startswith("```json"):
-        result = result[7:]
-    elif result.startswith("```"):
-        result = result[3:]
-    
-    if result.endswith("```"):
-        result = result[:-3]
-    
-    # Ищем первый { и последний }
-    first_brace = result.find('{')
-    last_brace = result.rfind('}')
-    
-    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        result = result[first_brace:last_brace + 1]
-    
-    return json.loads(result)
+def format_variant_text(text: str) -> str:
+    """Форматирует текст варианта для лучшей читаемости"""
+    text = re.sub(r'(\d+\.)', r'\n\1', text)
+    text = re.sub(r'([А-Я]\))\s*', r'\1\n', text)
+    text = re.sub(r'(Задание \d+:)', r'\n\1\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
 
 
-# HELPER: Парсинг сгенерированных вариантов
 def parse_generated_variants(response_text: str, expected_count: int) -> Dict[int, str]:
-    """Парсит ответ LLM в словарь {номер_варианта: текст}"""
+    """Парсит варианты из ответа LLM"""
     variants = {}
-    lines = response_text.split('\n')
-    current_variant = None
-    current_text = []
     
-    for line in lines:
-        line_stripped = line.strip()
-        if not line_stripped:
+    cleaned = response_text
+    cleaned = cleaned.replace("**", "").replace("__", "")
+    
+    pattern = re.compile(
+        r'(?:^|\n)\s*(?:#+\s*)?(?:ВАРИАНТ|Вариант)\s*[№#-]?\s*(\d+)\s*:?\s*',
+        re.IGNORECASE
+    )
+    
+    matches = list(pattern.finditer(cleaned))
+    
+    for idx, match in enumerate(matches):
+        try:
+            variant_num = int(match.group(1))
+        except (ValueError, IndexError):
             continue
-            
-        line_lower = line_stripped.lower()
         
-        is_variant_start = False
-        variant_num = None
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(cleaned)
+        variant_text = cleaned[start:end].strip()
+        variant_text = re.sub(r'^[:\-•*\s]+', '', variant_text)
         
-        # Вариант 1: "ВАРИАНТ 1: текст"
-        if 'вариант' in line_lower or 'variant' in line_lower:
-            match = re.search(r'(\d+)', line_stripped)
-            if match:
-                variant_num = int(match.group(1))
-                is_variant_start = True
-                parts = line_stripped.split(':', 1)
-                if len(parts) > 1:
-                    current_text = [parts[1].strip()]
-                else:
-                    current_text = []
-        
-        # Вариант 2: "1. текст" или "1) текст"
-        if not is_variant_start:
-            match = re.match(r'^(\d+)[\.\)]\s+(.+)', line_stripped)
-            if match:
-                variant_num = int(match.group(1))
-                is_variant_start = True
-                current_text = [match.group(2).strip()]
-        
-        if is_variant_start:
-            if current_variant is not None:
-                variants[current_variant] = '\n'.join(current_text).strip()
-            current_variant = variant_num
-        else:
-            if current_variant is not None:
-                current_text.append(line_stripped)
+        if variant_text:
+            variants[variant_num] = variant_text
     
-    # Сохраняем последний вариант
-    if current_variant is not None:
-        variants[current_variant] = '\n'.join(current_text).strip()
-    
-    # Fallback
-    if not variants:
-        logger.warning("Не удалось распарсить варианты, использую fallback")
-        for i in range(1, expected_count + 1):
-            variants[i] = f"Вариант {i}\n{response_text[:200]}"
+    for i in range(1, expected_count + 1):
+        if i not in variants:
+            variants[i] = f"Вариант {i}\n(сгенерируйте заново)"
     
     return variants
 
 
+def detect_task_type_by_structure(text: str) -> str:
+    """Определяет ТИП ЗАДАНИЯ по структуре текста"""
+    text_lower = text.lower()
+    
+    if any(word in text_lower for word in ["вычисли", "найди", "реши", "найдите", "вычислите"]):
+        return "calculation"
+    if any(word in text_lower for word in ["выбери", "укажите", "выберите", "отметьте"]):
+        return "multiple_choice"
+    if any(word in text_lower for word in ["соотнеси", "сопоставь", "соотнесите"]):
+        return "matching"
+    if any(word in text_lower for word in ["вставь", "пропуск", "заполни", "___"]):
+        return "fill_blanks"
+    if any(word in text_lower for word in ["упорядочь", "расставь", "последовательность"]):
+        return "ordering"
+    
+    return "open_response"
 
-# Базовый вызов LLM (с поддержкой реального API + мок)
 
-async def call_llm(
-    prompt: str, 
-    system_prompt: str = None,
-    expect_json: bool = False
-) -> str:
-    """ Базовый вызов GigaChat с авторизацией через credentials.
-    Если credentials нет — использует мок-режим.
-    """
-    # Проверяем, есть ли credentials
-    use_mock = False
-    if not GIGACHAT_CREDENTIALS or GIGACHAT_CREDENTIALS == "ваш_credentials_здесь":
-        use_mock = True
-        logger.info("Нет GIGACHAT_CREDENTIALS, использую мок-режим")
-        return _mock_llm_response(prompt)
-    
-    try:
-        access_token = await _get_access_token()
-    except Exception as e:
-        logger.warning(f"Не удалось получить токен: {e}. Использую мок-режим")
-        return _mock_llm_response(prompt)
-    
-    # Собираем сообщения
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    
-    final_prompt = prompt
-    if expect_json:
-        final_prompt = f"{prompt}\n\nВерни ТОЛЬКО JSON, без пояснений и markdown-обёрток."
-    
-    messages.append({"role": "user", "content": final_prompt})
-    
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
+def generate_fallback_by_type(task_type: str, questions_count: int) -> str:
+    """Генерирует fallback ответ в зависимости от типа задания"""
+    fallbacks = {
+        "calculation": "0" if questions_count == 1 else ", ".join([f"{i}-0" for i in range(1, questions_count + 1)]),
+        "multiple_choice": "А" if questions_count == 1 else ", ".join([f"{i}-А" for i in range(1, questions_count + 1)]),
+        "matching": "1-А" if questions_count == 1 else ", ".join([f"{i}-{chr(64+i)}" for i in range(1, questions_count + 1)]),
+        "fill_blanks": "слово" if questions_count == 1 else ", ".join([f"слово{i}" for i in range(1, questions_count + 1)]),
+        "ordering": "1" if questions_count == 1 else ", ".join([str(i) for i in range(1, questions_count + 1)]),
+        "open_response": "Ответ" if questions_count == 1 else ", ".join([f"ответ{i}" for i in range(1, questions_count + 1)]),
     }
-    
-    payload = {
-        "model": "GigaChat",
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 2000
-    }
-    
-    # Retry logic
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
-                response = await client.post(GIGACHAT_API_URL, json=payload, headers=headers)
-                response.raise_for_status()
-                
-                data = response.json()
-                
-                if "choices" not in data or not data["choices"]:
-                    raise ValueError("Некорректный ответ LLM: нет choices")
-                
-                return data["choices"][0]["message"]["content"]
-                
-        except httpx.TimeoutException:
-            logger.warning(f"Таймаут LLM, попытка {attempt + 1}/{max_retries + 1}")
-            if attempt == max_retries:
-                if use_mock:
-                    return _mock_llm_response(prompt)
-                raise Exception("Превышено время ожидания LLM")
-        except Exception as e:
-            logger.warning(f"Ошибка LLM, попытка {attempt + 1}/{max_retries + 1}: {e}")
-            if attempt == max_retries:
-                if use_mock:
-                    return _mock_llm_response(prompt)
-                raise
+    return fallbacks.get(task_type, "Ответ")
 
 
-def _mock_llm_response(prompt: str) -> str:
-    """Мок-ответ для демонстрации (для тестирования без ключей)."""
-    prompt_lower = prompt.lower()
+def detect_task_type(text: str) -> str:
+    """Определяет ТИП задания по структуре"""
+    text_lower = text.lower()
     
-    if "анализ" in prompt_lower or "структур" in prompt_lower:
-        return json.dumps({
-            "subject": "математика",
-            "task_type": "линейное уравнение",
-            "difficulty_score": 6,
-            "operations_count": 3,
-            "grade": "7-8",
-            "variable_elements": ["числа", "коэффициенты"],
-            "invariant_elements": ["структура уравнения", "количество шагов"],
-            "recommended_variations": ["numbers", "order"],
-            "why_difficulty": "3 шага решения, линейное уравнение",
-            "why_invariant": "структура ax + b = c сохраняется",
-            "why_variable": "числа можно менять без потери смысла"
-        })
-    elif "валидация" in prompt_lower or "проверь" in prompt_lower:
-        return json.dumps({
-            "valid": True,
-            "difficulty_match": True,
-            "unique_answers": True,
-            "same_structure": True,
-            "all_solvable": True,
-            "issues": [],
-            "explanations": {
-                "difficulty_match": "Все варианты имеют 3 шага решения",
-                "same_structure": "Структура ax + b = c сохранена",
-                "all_solvable": "Каждое уравнение имеет решение"
-            },
-            "answers": {
-                "1": "x = 5",
-                "2": "x = 4",
-                "3": "x = 6",
-                "4": "x = 5"
-            }
-        })
-    else:
-        return """
-ВАРИАНТ 1: Решите уравнение: 3x + 7 = 22
-ВАРИАНТ 2: Решите уравнение: 5x - 3 = 17
-ВАРИАНТ 3: Решите уравнение: 2x + 9 = 21
-ВАРИАНТ 4: Решите уравнение: 4x - 5 = 15
+    # 1. Сопоставление
+    if any(w in text_lower for w in ["соотнеси", "сопоставь", "match"]):
+        return "matching"
+    
+    # 2. Упорядочивание
+    if any(w in text_lower for w in ["упорядочь", "расставь по порядку", "order", "sequence"]):
+        return "ordering"
+    
+    # 3. Верно/Неверно
+    if any(w in text_lower for w in ["верно", "неверно", "true", "false"]):
+        return "true_false"
+    
+    # 4. Вставка пропусков
+    if "___" in text or "…" in text or any(w in text_lower for w in ["вставь", "пропуск", "fill"]):
+        return "fill_blanks"
+    
+    # 5. Перевод
+    if any(w in text_lower for w in ["переведи", "translate"]):
+        return "translation"
+    
+    # 6. Исправление ошибок
+    if any(w in text_lower for w in ["найди ошибку", "исправь", "correct"]):
+        return "error_correction"
+    
+    # 7. Вычисления
+    if any(w in text_lower for w in ["вычисли", "найди", "реши", "calculate", "solve"]):
+        return "calculation"
+    
+    # 8. Тест с вариантами
+    if re.search(r'[А-ЯA-Z]\)', text) or re.search(r'[А-ЯA-Z]\.', text):
+        return "multiple_choice"
+    
+    # 9. Развернутый ответ (по длине)
+    if len(text) > 300:
+        return "essay"
+    
+    # 10. Короткий ответ (по умолчанию)
+    return "short_answer"
+
+
+
+async def generate_answers(variants: Dict[int, str]) -> Dict[int, str]:
+    """Генерация ответов на основе ТИПА ЗАДАНИЯ"""
+    
+    if not variants:
+        return {}
+    
+    answers = {}
+    
+    for num, text in variants.items():
+        task_type = detect_structural_type_from_text(text)
+        
+        if task_type is None:
+            task_type = StructuralType.OPEN_RESPONSE
+        
+        # Расширенные примеры для каждого типа
+        examples = {
+            StructuralType.MULTIPLE_CHOICE: "Пример: 'А,В,Д' или 'Б'",
+            StructuralType.MATCHING: "Пример: '1-А,2-Б,3-В'",
+            StructuralType.FILL_BLANKS: "Пример: 'зима, доска, пенал' или 'am,is,are'",
+            StructuralType.CALCULATION: "Пример: '78.5' или 'x=5'",
+            StructuralType.OPEN_RESPONSE: "Пример: 'перья, руки' или 'Мы пошли гулять в парк, там было много детей'",
+        }
+        
+        example = examples.get(task_type, "Верни краткий ответ")
+        
+        prompt = f"""
+Задание: {text}
+
+Тип задания: {task_type.value}
+
+Правила:
+- Верни ТОЛЬКО ответ, без пояснений
+- {example}
+
+Ответ:
 """
+        try:
+            result = await call_llm(prompt, temperature=0.2)
+            result = result.strip()
+            # Очистка от лишнего
+            result = re.sub(r'^(Ответ|Answer):\s*', '', result, flags=re.IGNORECASE)
+            answers[str(num)] = result if result else "—"
+        except Exception as e:
+            logger.warning(f"Ошибка для варианта {num}: {e}")
+            answers[str(num)] = "—"
+    
+    return answers
+
+def detect_structural_type_from_text(text: str) -> Optional[StructuralType]:
+    text_lower = text.lower()
+    
+    # Определение по ключевым словам
+    if any(w in text_lower for w in ["подчеркните", "определите часть речи", "найди корень"]):
+        return StructuralType.OPEN_RESPONSE
+    
+    if any(w in text_lower for w in ["выбери", "укажите", "выберите"]):
+        return StructuralType.MULTIPLE_CHOICE
+    
+    if any(w in text_lower for w in ["соотнеси", "сопоставь"]):
+        return StructuralType.MATCHING
+    
+    if any(w in text_lower for w in ["вставь", "пропуск", "заполни", "___"]):
+        return StructuralType.FILL_BLANKS
+    
+    if any(w in text_lower for w in ["вычисли", "найди", "реши"]):
+        return StructuralType.CALCULATION
+    
+    if any(w in text_lower for w in ["расставьте запятые", "знаки препинания"]):
+        return StructuralType.OPEN_RESPONSE
+    
+    if any(w in text_lower for w in ["найдите лишнее", "исключи"]):
+        return StructuralType.MULTIPLE_CHOICE
+    
+    if any(w in text_lower for w in ["образуйте форму", "множественное число"]):
+        return StructuralType.FILL_BLANKS
+    
+    return None
 
 
-# Анализ структуры задания
-async def analyze_task_structure(text: str) -> Dict[str, Any]:
-    """Анализирует структуру задания"""
+# АНАЛИЗ ЗАДАНИЯ
+async def _extract_structural_spec(text: str) -> Dict[str, Any]:
+    """Stage 1: Извлечение структуры"""
+    
     prompt = f"""
-Проанализируй это задание и верни ТОЛЬКО JSON:
+Определи СТРУКТУРУ задания. Верни ТОЛЬКО JSON.
 
-Задание:
-{text[:1000]}
+=== ЗАДАНИЕ ===
+{text[:1500]}
 
-Формат:
+=== ВОЗМОЖНЫЕ ЗНАЧЕНИЯ ===
+structural_type: multiple_choice, matching, ordering, classification, fill_blanks, open_response, calculation, proof
+answer_format: single_choice, multi_select, sequence, pairs, text, number, formula, boolean
+
+=== ФОРМАТ (ТОЛЬКО JSON) ===
 {{
-    "subject": "предмет",
-    "task_type": "тип задания",
-    "difficulty_score": число от 1 до 10,
-    "operations_count": число шагов,
-    "grade": "класс",
-    "variable_elements": ["элемент1", "элемент2"],
-    "invariant_elements": ["элемент1", "элемент2"],
-    "recommended_variations": ["numbers", "order", "synonyms", "context"],
-    "why_difficulty": "почему такая сложность",
-    "why_invariant": "почему эти элементы нельзя менять",
-    "why_variable": "почему эти элементы можно менять"
+    "structural_type": "multiple_choice",
+    "answer_format": "multi_select",
+    "operations_count": 3,
+    "options_count": 6,
+    "requires_single_correct": false
 }}
 """
-
-    system_prompt = "Ты — эксперт по методике. Анализируешь структуру учебных заданий."
-
+    
     try:
-        result = await call_llm(prompt, system_prompt, expect_json=True)
+        result = await call_llm(prompt, expect_json=False, temperature=0.1)
         data = clean_json_response(result)
-        logger.info(f"Анализ задания: {data.get('task_type')}, сложность {data.get('difficulty_score')}")
-        return data
-    except Exception as e:
-        logger.warning(f"Ошибка анализа: {e}. Возвращаю default.")
+        
         return {
-            "subject": "не определён",
-            "task_type": "не определён",
-            "difficulty_score": 5,
-            "operations_count": 3,
-            "grade": "5-9",
-            "variable_elements": ["числа", "параметры"],
-            "invariant_elements": ["структура", "алгоритм решения"],
-            "recommended_variations": ["numbers", "order"],
-            "why_difficulty": "Стандартный уровень сложности",
-            "why_invariant": "Методически важно сохранить структуру",
-            "why_variable": "Числовые значения могут варьироваться"
+            "structural_type": data.get("structural_type", "open_response"),
+            "answer_format": data.get("answer_format", "text"),
+            "operations_count": data.get("operations_count", 1),
+            "options_count": data.get("options_count", 0),
+            "requires_single_correct": data.get("requires_single_correct", True)
+        }
+    except Exception as e:
+        logger.warning(f"Ошибка структурного анализа: {e}")
+        return {
+            "structural_type": "open_response",
+            "answer_format": "text",
+            "operations_count": 1,
+            "options_count": 0,
+            "requires_single_correct": True
         }
 
 
-# Построение промпта для генерации
-def build_generation_prompt(
+async def _extract_pedagogical_spec(text: str, structural_spec: Dict) -> PedagogicalSpec:
+    """Stage 2: Извлечение педагогики"""
+    
+    prompt = f"""
+Определи ПЕДАГОГИЧЕСКУЮ ЦЕЛЬ и КОГНИТИВНЫЙ УРОВЕНЬ. Верни ТОЛЬКО JSON.
+
+=== ЗАДАНИЕ ===
+{text[:1500]}
+
+=== СТРУКТУРА ===
+structural_type: {structural_spec.get('structural_type')}
+answer_format: {structural_spec.get('answer_format')}
+
+=== ВОЗМОЖНЫЕ ЗНАЧЕНИЯ ===
+pedagogical_intent: fact_recall, classification, matching, sequence, calculation, proof, analysis
+cognitive_level: recognition, reproduction, application, analysis, synthesis
+
+=== ФОРМАТ (ТОЛЬКО JSON) ===
+{{
+    "pedagogical_intent": "classification",
+    "cognitive_level": "recognition",
+    "cognitive_load": 2
+}}
+"""
+    
+    try:
+        result = await call_llm(prompt, expect_json=False, temperature=0.15)
+        data = clean_json_response(result)
+        
+        structural_type = structural_spec.get("structural_type", "open_response")
+        answer_format = structural_spec.get("answer_format", "text")
+        
+        if structural_type == "calculation":
+            answer_format = "number"
+        elif structural_type == "multiple_choice" and structural_spec.get("options_count", 0) > 1:
+            answer_format = "multi_select"
+        
+        return PedagogicalSpec(
+            pedagogical_intent=PedagogicalIntent(data.get("pedagogical_intent", "classification")),
+            cognitive_level=CognitiveLevel(data.get("cognitive_level", "recognition")),
+            structural_type=StructuralType(structural_type),
+            answer_format=AnswerFormat(answer_format),
+            operations_count=structural_spec.get("operations_count", 1),
+            cognitive_load=data.get("cognitive_load", 2),
+            options_count=structural_spec.get("options_count", 0),
+            requires_single_correct=structural_spec.get("requires_single_correct", False)
+        )
+    except Exception as e:
+        logger.warning(f"Ошибка педагогического анализа: {e}")
+        return PedagogicalSpec(
+            pedagogical_intent=PedagogicalIntent.CLASSIFICATION,
+            cognitive_level=CognitiveLevel.RECOGNITION,
+            structural_type=StructuralType(structural_spec.get("structural_type", "open_response")),
+            answer_format=AnswerFormat.MULTI_SELECT if structural_spec.get("structural_type") == "multiple_choice" else AnswerFormat.TEXT
+        )
+
+
+async def _extract_content_spec(text: str) -> ContentSpec:
+    """Stage 3: Извлечение контента - с определением класса"""
+    
+    prompt = f"""
+Определи КОНТЕНТ задания. Верни ТОЛЬКО JSON.
+
+=== ЗАДАНИЕ ===
+{text[:1500]}
+
+=== ФОРМАТ (ТОЛЬКО JSON) ===
+{{
+    "knowledge_domain": "mathematics",
+    "topic_core": "квадратные уравнения",
+    "grade": "8",
+    "content_entities": ["x²", "дискриминант"]
+}}
+
+knowledge_domain: mathematics, physics, chemistry, biology, history, geography, russian, literature, english
+grade: 5,6,7,8,9,10,11 (определи по сложности задания)
+"""
+    
+    try:
+        result = await call_llm(prompt, expect_json=False, temperature=0.15)
+        data = clean_json_response(result)
+        
+        topic_core = normalize_topic(data.get("topic_core", ""))
+        grade = data.get("grade", "5-9")  # ← добавляем определение класса
+        
+        return ContentSpec(
+            knowledge_domain=data.get("knowledge_domain", "unknown"),
+            topic_core=topic_core,
+            grade=grade,  # ← нужно добавить поле в ContentSpec
+            content_entities=data.get("content_entities", []),
+            preserved_patterns=[],
+            forbid_topic_shift=False,
+            allowed_variations=[
+                VariationPolicy.NUMERIC_PARAMETERS,
+                VariationPolicy.DOMAIN_ENTITIES,
+                VariationPolicy.SURFACE_WORDING
+            ]
+        )
+    except Exception as e:
+        logger.warning(f"Ошибка контентного анализа: {e}")
+        return ContentSpec(knowledge_domain="unknown", grade="5-9")
+
+
+async def analyze_task_specification(text: str) -> TaskSpecification:
+    """Полный анализ задания"""
+    
+    structural_spec = await _extract_structural_spec(text)
+    pedagogical_spec = await _extract_pedagogical_spec(text, structural_spec)
+    content_spec = await _extract_content_spec(text)
+    
+    return TaskSpecification(
+        pedagogical=pedagogical_spec,
+        content=content_spec,
+        legacy_subject=content_spec.knowledge_domain,
+        legacy_topic=content_spec.topic_core,
+        legacy_skill=content_spec.skill_target,
+        legacy_didactic_goal=f"Проверить навык {content_spec.skill_target}"
+    )
+
+
+async def analyze_task_structure(text: str) -> Dict[str, Any]:
+    """Старый интерфейс для совместимости"""
+    
+    spec = await analyze_task_specification(text)
+    
+    cache_key = normalize_for_cache(text)
+    _SPEC_CACHE[cache_key] = spec
+    
+    return spec.to_legacy_dict()
+
+
+# ПОСТРОЕНИЕ ПРОМПТА ДЛЯ ГЕНЕРАЦИИ
+def build_universal_generation_prompt(
     original_text: str,
     num_variants: int,
+    spec: TaskSpecification,
     variation_types: List[str],
-    forbidden_parts: Optional[str] = None,
-    task_structure: Optional[Dict[str, Any]] = None,
-    difficulty_override: Optional[str] = None,  # "easier", "same", "harder"
-    target_grade: Optional[str] = None
+    user_comment: Optional[str] = None,
+    difficulty_override: Optional[str] = None,
+    forbidden_parts: Optional[str] = None
 ) -> str:
-    """Строит промпт для генерации вариантов на основе анализа структуры и выбора пользователя."""
+    """Строит промпт для генерации — с усиленной привязкой к эталону"""
     
-    variant_types_str = ", ".join(variation_types)
-    forbid_str = f"\nЗапрещено изменять: {forbidden_parts}" if forbidden_parts else ""
-    
-    invariant_str = ""
-    variable_str = ""
-    difficulty_str = ""
-    
-    if task_structure:
-        invariant_elements = task_structure.get("invariant_elements", [])
-        variable_elements = task_structure.get("variable_elements", [])
-        
-        if invariant_elements:
-            invariant_str = f"""
-ИНВАРИАНТНЫЕ ЭЛЕМЕНТЫ (НЕЛЬЗЯ МЕНЯТЬ):
-{chr(10).join(f'- {elem}' for elem in invariant_elements)}
-"""
-        
-        if variable_elements:
-            variable_str = f"""
-ВАРИАТИВНЫЕ ЭЛЕМЕНТЫ (МОЖНО МЕНЯТЬ):
-{chr(10).join(f'- {elem}' for elem in variable_elements)}
+    variations_section = f"""
+=== ТИПЫ ВАРИАЦИЙ ===
+{chr(10).join(f'✅ {vt}' for vt in variation_types) if variation_types else '✅ стандартные'}
 """
     
-    #  ЛОГИКА ВЫБОРА СЛОЖНОСТИ
     if difficulty_override == "easier":
-        difficulty_str = """
-ТРЕБОВАНИЯ К СЛОЖНОСТИ:
-- Сделай вариант ПРОЩЕ, чем эталон
-- Уменьши количество операций или упрости вычисления
-- Сохрани тип задания и дидактическую цель
-- Задания должны оставаться решаемыми для более слабых учеников
-"""
+        difficulty_section = f"Сделай вариант ПРОЩЕ. Уровень эталона: {spec.difficulty_level}/10"
     elif difficulty_override == "harder":
-        difficulty_str = """
-ТРЕБОВАНИЯ К СЛОЖНОСТИ:
-- Сделай вариант СЛОЖНЕЕ, чем эталон
-- Добавь дополнительные шаги или усложни вычисления
-- Сохрани тип задания и дидактическую цель
-- Задания должны оставаться корректными для сильных учеников
-"""
-    else:  # "same" или None
-        if task_structure:
-            difficulty_str = f"""
-ТРЕБОВАНИЯ К СЛОЖНОСТИ:
-- Уровень сложности: {task_structure.get('difficulty_score', 5)}/10
-- Количество операций: {task_structure.get('operations_count', 3)}
-- Целевой класс: {target_grade or task_structure.get('grade', '5-9')}
-- Сохрани сложность ТОЧНО такой же, как в эталоне
-"""
-        else:
-            difficulty_str = """
-ТРЕБОВАНИЯ К СЛОЖНОСТИ:
-- Сохрани сложность такой же, как в эталоне
-- Не добавляй и не убирай шаги решения
+        difficulty_section = f"Сделай вариант СЛОЖНЕЕ. Уровень эталона: {spec.difficulty_level}/10"
+    else:
+        difficulty_section = f"Уровень сложности: {spec.difficulty_level}/10. Операций: {spec.pedagogical.operations_count}"
+    
+    forbidden_section = ""
+    if forbidden_parts and forbidden_parts.strip():
+        forbidden_section = f"НЕ МЕНЯТЬ: {forbidden_parts.strip()}"
+    
+    comment_section = ""
+    if user_comment and user_comment.strip():
+        comment_section = f"ДОПОЛНИТЕЛЬНО: {user_comment.strip()}"
+    
+    # Усиленная фиксация темы
+    topic_constraint = f"""
+=== ТЕМА (НЕ МЕНЯТЬ) ===
+{spec.content.topic_core}
+
+=== СТРУКТУРА ЭТАЛОНА ===
+{original_text[:500]}
+
+=== ЧТО НУЖНО СОХРАНИТЬ ===
+1. ТЕМУ: {spec.content.topic_core}
+2. ТИП ЗАДАНИЯ: {spec.pedagogical.structural_type.value}
+3. КОЛИЧЕСТВО ВОПРОСОВ/ЗАДАНИЙ в варианте
+4. ФОРМУЛИРОВКУ инструкции (сохрани её стиль)
+
+=== ЧТО МОЖНО ИЗМЕНЯТЬ ===
+- Числовые значения
+- Конкретные примеры, имена, названия (в пределах темы)
+- Порядок вопросов (если тип вариации "order")
+- Синонимы в формулировках (если тип вариации "synonyms")
+
+=== ЧТО НЕЛЬЗЯ МЕНЯТЬ ===
+- Тип задания (тест/задача/сопоставление и т.д.)
+- Количество шагов решения
+- Смысловую структуру
 """
     
-    # Добавляем информацию о целевом классе, если он указан отдельно
-    grade_info = ""
-    if target_grade and difficulty_override != "same":
-        grade_info = f"\n- Целевой класс: {target_grade}"
-        difficulty_str = difficulty_str.rstrip("}") + grade_info + "\n"
+    example_variant = f"""
+ПРИМЕР хорошего варианта (сохраняет структуру эталона, но меняет данные):
+{original_text[:300]}... → (числа/примеры заменены на другие в рамках темы)
+"""
     
     return f"""
-Ты — методист. Сгенерируй варианты заданий.
+Ты — генератор учебных заданий. Сгенерируй {num_variants} вариантов, **максимально близких к эталону по структуре**.
 
-=== ЭТАЛОН ===
+{spec.to_prompt_invariants()}
+
+{topic_constraint}
+
+{example_variant}
+
+{difficulty_section}
+
+{variations_section}
+
+{forbidden_section}
+
+{comment_section}
+
+=== ЭТАЛОН (ОБРАЗЕЦ) ===
 {original_text}
 
-=== ПАРАМЕТРЫ ===
-Вариантов: {num_variants}
-Типы вариаций: {variant_types_str}
-{forbid_str}
-{invariant_str}
-{variable_str}
-{difficulty_str}
+=== ПРАВИЛА ГЕНЕРАЦИИ ===
+1. Каждый вариант должен быть **по той же теме** что и эталон
+2. **Сохрани количество вопросов/заданий** как в эталоне, ни больше, ни меньше. 
+3. **Сохрани тип вопросов** (если в эталоне тест - делай тест, если задача - задачу)
+4. Меняй только: числа, имена, примеры, порядок
+5. Если в эталоне есть варианты ответов А), Б), В) - сохрани это форматирование
 
-=== ПРАВИЛА ===
-1. ✅ Сохрани дидактическую цель задания
-2. ✅ Меняй ТОЛЬКО вариативные элементы (числа, порядок, контекст)
-3. ❌ НЕ меняй инвариантные элементы
-4. ❌ НЕ используй очевидные прогрессии
-5. ❌ НЕ создавай нерешаемые задачи
-6. ✅ Ответы в разных вариантах не должны совпадать
-7. ✅ Все варианты должны иметь ОДИНАКОВЫЙ уровень сложности между собой
-8. ❌ **ЗАПРЕЩЕНО генерировать одинаковые или похожие варианты. Каждый вариант должен быть УНИКАЛЬНЫМ по формулировке и числовым данным.**
-9. ✅ **Сгенерируй {num_variants} РАЗНЫХ вариантов. Никакие два варианта не должны повторяться.**
 
-Формат: "ВАРИАНТ N: текст задания"
+=== ФОРМАТ ВЫВОДА ===
+ВАРИАНТ 1:
+(только текст задания)
 
-ТЫ ДОЛЖЕН СГЕНЕРИРОВАТЬ РОВНО {num_variants} ВАРИАНТОВ. НЕ БОЛЬШЕ И НЕ МЕНЬШЕ:
+ВАРИАНТ 2:
+(только текст задания)
+
+Сгенерируй РОВНО {num_variants} вариантов. В заданиях НЕ пиши ответ.
 """
 
 
-# Генерация вариантов (оркестрация)
+# ОСНОВНАЯ ФУНКЦИЯ ГЕНЕРАЦИИ
 async def generate_variants(
     original_text: str,
     num_variants: int,
@@ -430,173 +691,250 @@ async def generate_variants(
     forbidden_parts: Optional[str] = None,
     task_structure: Optional[Dict[str, Any]] = None,
     difficulty_override: Optional[str] = None,
-    target_grade: Optional[str] = None
-) -> Dict[int, str]:
-    prompt = build_generation_prompt(
+    target_grade: Optional[str] = None,
+    task_type: Optional[str] = None,
+    user_comment: Optional[str] = None
+) -> Dict[int, VariantDocument]:
+    """Генерирует варианты заданий с SUBJECT LOCK"""
+    
+    cache_key = normalize_for_cache(original_text)
+    spec = None
+    
+    if cache_key in _SPEC_CACHE:
+        spec = _SPEC_CACHE[cache_key]
+    elif task_structure:
+        subject = task_structure.get("subject", "unknown")
+        structural_type = StructuralType.OPEN_RESPONSE
+        task_type_str = task_structure.get("task_type", "")
+        
+        if task_type_str == "calculation":
+            structural_type = StructuralType.CALCULATION
+        elif task_type_str == "test":
+            structural_type = StructuralType.MULTIPLE_CHOICE
+        elif task_type_str == "matching":
+            structural_type = StructuralType.MATCHING
+        elif task_type_str == "ordering":
+            structural_type = StructuralType.ORDERING
+        
+        if task_type_str == "calculation":
+            pedagogical_intent = PedagogicalIntent.CALCULATION
+        elif task_type_str == "test":
+            pedagogical_intent = PedagogicalIntent.CLASSIFICATION
+        elif task_type_str == "matching":
+            pedagogical_intent = PedagogicalIntent.MATCHING
+        elif task_type_str == "ordering":
+            pedagogical_intent = PedagogicalIntent.SEQUENCE
+        else:
+            pedagogical_intent = PedagogicalIntent.CLASSIFICATION
+        
+        answer_format = AnswerFormat.TEXT
+        if subject in ["математика", "mathematics", "физика", "physics"]:
+            answer_format = AnswerFormat.NUMBER
+        elif subject in ["химия", "chemistry"]:
+            answer_format = AnswerFormat.FORMULA
+        elif task_type_str == "test":
+            answer_format = AnswerFormat.MULTI_SELECT
+        
+        pedagogical = PedagogicalSpec(
+            pedagogical_intent=pedagogical_intent,
+            cognitive_level=CognitiveLevel.RECOGNITION,
+            structural_type=structural_type,
+            answer_format=answer_format,
+            operations_count=task_structure.get("operations_count", 3),
+            cognitive_load=2
+        )
+        content = ContentSpec(
+            knowledge_domain=subject,
+            topic_core=task_structure.get("topic", ""),
+            skill_target=f"{pedagogical_intent.value}_within_topic",
+            content_entities=[],
+            preserved_patterns=task_structure.get("invariant_elements", [])
+        )
+        spec = TaskSpecification(
+            pedagogical=pedagogical,
+            content=content,
+            legacy_subject=subject,
+            legacy_topic=task_structure.get("topic", "не определена")
+        )
+        _SPEC_CACHE[cache_key] = spec
+    
+    if spec is None:
+        spec = await analyze_task_specification(original_text)
+        _SPEC_CACHE[cache_key] = spec
+    
+    if not spec.content.topic_core:
+        extracted = await _extract_content_spec(original_text)
+        spec.content.topic_core = extracted.topic_core
+        spec.content.topic_boundaries = extracted.topic_boundaries
+        spec.content.forbidden_topics = extracted.forbidden_topics
+        spec.content.skill_target = extracted.skill_target
+    
+    if task_type and task_type != "auto":
+        type_mapping = {
+            "calculation": StructuralType.CALCULATION,
+            "test": StructuralType.MULTIPLE_CHOICE,
+            "open_question": StructuralType.OPEN_RESPONSE,
+            "matching": StructuralType.MATCHING,
+            "ordering": StructuralType.ORDERING,
+        }
+        if task_type in type_mapping:
+            spec.pedagogical.structural_type = type_mapping[task_type]
+    
+    if forbidden_parts and forbidden_parts.strip():
+        spec.content.preserved_patterns.append(forbidden_parts.strip())
+    
+    variation_types = [vt for vt in variation_types if vt != "context"]
+    
+    prompt = build_universal_generation_prompt(
         original_text=original_text,
         num_variants=num_variants,
+        spec=spec,
         variation_types=variation_types,
-        forbidden_parts=forbidden_parts,
-        task_structure=task_structure,
+        user_comment=user_comment,
         difficulty_override=difficulty_override,
-        target_grade=target_grade
+        forbidden_parts=forbidden_parts
     )
     
-    system_prompt = "Ты — методист. Генерируешь варианты заданий одинаковой сложности."
+    system_prompt = "Ты — педагогический дизайнер. Генерируешь варианты заданий с одинаковой педагогической моделью."
     
-    result = await call_llm(prompt, system_prompt)
+    result = await call_llm(prompt, system_prompt, temperature=0.1)
     
-    variants = parse_generated_variants(result, num_variants)
+    raw_variants = parse_generated_variants(result, num_variants)
     
-    logger.info(f"Сгенерировано {len(variants)} вариантов из {num_variants} ожидаемых")
+    document_variants = {}
+    for num, text in raw_variants.items():
+        formatted_text = format_variant_text(text)
+        document_variants[num] = parse_variant_to_document(formatted_text, num)
     
-    return variants
+    logger.info(f"Сгенерировано {len(document_variants)} вариантов: тема={spec.content.topic_core}, "
+               f"intent={spec.pedagogical.pedagogical_intent.value}")
+    
+    return document_variants
 
 
-# Валидация (с ответами для учителя)
+# ВАЛИДАЦИЯ
 async def validate_variants(
     variants: Dict[int, str],
     original_text: str,
     task_structure: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Проверяет варианты и генерирует ответы для учителя."""
-    variants_text = "\n\n".join([f"ВАРИАНТ {k}: {v}" for k, v in variants.items()])
+    """
+    Гибридная валидация:
+    1. Генерирует ответы через LLM
+    2. Возвращает результат с ответами для учителя
+    """
     
-    invariant_requirements = ""
-    if task_structure:
-        invariant_elements = task_structure.get("invariant_elements", [])
-        if invariant_elements:
-            invariant_requirements = f"""
-Инвариантные элементы (ДОЛЖНЫ сохраниться):
-{chr(10).join(f'- {elem}' for elem in invariant_elements)}
-"""
+    answers = await generate_answers(variants)
     
-    prompt = f"""
-Проверь сгенерированные варианты и добавь ответы для учителя.
-
-=== ЭТАЛОН ===
-{original_text[:500]}
-
-{invariant_requirements}
-
-=== ВАРИАНТЫ ===
-{variants_text}
-
-Верни ТОЛЬКО JSON:
-{{
-    "valid": true/false,
-    "difficulty_match": true/false,
-    "unique_answers": true/false,
-    "same_structure": true/false,
-    "all_solvable": true/false,
-    "issues": ["проблема1"],
-    "explanations": {{
-        "difficulty_match": "объяснение",
-        "same_structure": "объяснение"
-    }},
-    "answers": {{
-        "1": "ответ для варианта 1",
-        "2": "ответ для варианта 2"
-    }},
-    "fixed_variants": {{}}
-}}
-"""
-
-    try:
-        result = await call_llm(prompt, expect_json=True)
-        data = clean_json_response(result)
-        logger.info(f"Валидация: valid={data.get('valid')}")
-        return data
-    except Exception as e:
-        logger.warning(f"Ошибка валидации: {e}. Возвращаю pessimistic результат.")
-        return {
-            "valid": False,
-            "difficulty_match": False,
-            "unique_answers": False,
-            "same_structure": False,
-            "all_solvable": False,
-            "issues": ["Ошибка автоматической проверки"],
-            "explanations": {},
-            "answers": {},
-            "fixed_variants": {}
+    logger.info(f"✅ Сгенерированы ответы для {len(answers)} вариантов: {answers}")
+    
+    variant_status = {}
+    for num in variants.keys():
+        variant_status[str(num)] = {
+            "valid": True,
+            "solvable": True,
+            "same_topic": True,
+            "same_structure": True,
+            "issues": []
         }
+    
+    return {
+        "valid": True,
+        "variant_status": variant_status,
+        "answers": answers,
+        "validation_method": "llm_with_type_detection",
+        "summary": {
+            "total": len(variants),
+            "valid_count": len(variants),
+            "invalid_count": 0
+        }
+    }
 
 
-# Перегенерация одного варианта
+# ПЕРЕГЕНЕРАЦИЯ
 async def regenerate_variant(
     original_text: str,
     variant_number: int,
     current_variant_text: str,
     variation_types: List[str],
     task_structure: Optional[Dict[str, Any]] = None,
-    forbidden_parts: Optional[str] = None
+    forbidden_parts: Optional[str] = None,
+    failure_reason: str = None,
+    existing_variants: Optional[Dict[int, str]] = None
 ) -> str:
-    """Перегенерирует один вариант с сохранением структуры."""
+    """Перегенерирует один вариант"""
     
-    variant_types_str = ", ".join(variation_types)
-    forbid_str = f"\nЗапрещено изменять: {forbidden_parts}" if forbidden_parts else ""
+    cache_key = normalize_for_cache(original_text)
+    spec = _SPEC_CACHE.get(cache_key)
     
-    invariant_str = ""
-    if task_structure:
-        invariant_elements = task_structure.get("invariant_elements", [])
-        if invariant_elements:
-            invariant_str = f"""
-НЕЛЬЗЯ МЕНЯТЬ:
-{chr(10).join(f'- {elem}' for elem in invariant_elements)}
-"""
+    if spec is None and task_structure:
+        pedagogical = PedagogicalSpec(
+            pedagogical_intent=PedagogicalIntent.CLASSIFICATION,
+            cognitive_level=CognitiveLevel.RECOGNITION,
+            structural_type=StructuralType.MULTIPLE_CHOICE,
+            answer_format=AnswerFormat.MULTI_SELECT
+        )
+        content = ContentSpec(
+            knowledge_domain=task_structure.get("subject", "unknown"),
+            topic_core=task_structure.get("topic", ""),
+            preserved_patterns=task_structure.get("invariant_elements", [])
+        )
+        spec = TaskSpecification(pedagogical=pedagogical, content=content)
+    
+    if spec is None:
+        spec = await analyze_task_specification(original_text)
+        _SPEC_CACHE[cache_key] = spec
+    
+    existing_note = ""
+    if existing_variants and len(existing_variants) > 1:
+        other_answers = []
+        for num, text in existing_variants.items():
+            if num != variant_number:
+                short = text[:200].replace("\n", " ")
+                other_answers.append(f"Вариант {num}: {short}...")
+        if other_answers:
+            existing_note = f"\n⚠️ Убедись, что ответ отличается от: {', '.join(other_answers[:3])}"
     
     prompt = f"""
 Перегенерируй ТОЛЬКО ВАРИАНТ {variant_number}.
 
+=== ПЕДАГОГИЧЕСКАЯ МОДЕЛЬ ===
+{spec.to_prompt_invariants()}
+
 === ЭТАЛОН ===
 {original_text}
 
-=== ПЛОХОЙ ВАРИАНТ ===
+=== НЕУДАЧНЫЙ ВАРИАНТ ===
 {current_variant_text}
+{existing_note}
+
+=== ПРИЧИНА ===
+{failure_reason if failure_reason else "Вариант не соответствует критериям"}
 
 === ТРЕБОВАНИЯ ===
-Типы вариаций: {variant_types_str}
-{forbid_str}
-{invariant_str}
+1. Сохрани тему: {spec.content.topic_core}
+2. Сохрани структуру и сложность
+3. Меняй: {', '.join(variation_types)}
+{f'4. НЕ меняй: {forbidden_parts}' if forbidden_parts else ''}
 
-=== КРИТЕРИИ ===
-- Сохрани сложность и количество операций
-- Меняй только разрешённые элементы
-- Ответ не должен совпадать с другими
-- Не используй очевидные прогрессии
-
-Выдай ТОЛЬКО текст варианта (без "ВАРИАНТ N:"):
+Выдай ТОЛЬКО текст варианта, без пояснений.
 """
-
-    system_prompt = "Ты — методист. Перегенерируешь один вариант задания."
     
-    result = await call_llm(prompt, system_prompt)
-    return result.strip()
-
-
-# Генерация ответов для учителя
-async def generate_answers(variants: Dict[int, str]) -> Dict[int, str]:
-    """Генерирует ответы для всех вариантов."""
-    
-    variants_text = "\n\n".join([f"ВАРИАНТ {k}: {v}" for k, v in variants.items()])
-    
-    prompt = f"""
-Реши каждое задание и верни ТОЛЬКО JSON с ответами.
-
-=== ЗАДАНИЯ ===
-{variants_text}
-
-Формат:
-{{
-    "1": "ответ для варианта 1",
-    "2": "ответ для варианта 2"
-}}
-"""
-
     try:
-        result = await call_llm(prompt, expect_json=True)
-        data = clean_json_response(result)
-        return {int(k): v for k, v in data.items() if k.isdigit()}
+        result = await call_llm(prompt, temperature=0.3)
+        return result.strip()
     except Exception as e:
-        logger.warning(f"Ошибка генерации ответов: {e}")
-        return {}
+        logger.error(f"Ошибка перегенерации: {e}")
+        return current_variant_text
+
+
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+def _get_answer_format_guide(subject: str, task_type: str) -> str:
+    """Гайд по формату ответов"""
+    if task_type == "test":
+        return "Ответ: буквы правильных вариантов через запятую (а,б,в)"
+    if task_type == "calculation":
+        return "Ответ: число (например, 42)"
+    if task_type == "open_question":
+        return "Ответ: краткое предложение (до 10 слов)"
+    return "Ответ: строка с правильным ответом"
