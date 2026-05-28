@@ -5,6 +5,29 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TaskForge AI — Генератор вариантов заданий</title>
     <link rel="stylesheet" href="css/style.css">
+    
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['\\(', '\\)']],
+                displayMath: [['\\[', '\\]']],
+                processEscapes: true,
+                packages: ['base', 'ams', 'newcommand']
+            },
+            options: {
+                ignoreHtmlClass: 'ignore-math',
+                processHtmlClass: 'math'
+            },
+            startup: {
+                pageReady: () => {
+                    console.log('✅ MathJax готов');
+                    window.MATHJAX_READY = true;
+                    return MathJax.startup.defaultPageReady();
+                }
+            }
+        };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" id="MathJax-script" async></script>
 </head>
 <body>
     <div class="container">
@@ -14,10 +37,15 @@
                 <h1>⚡ TaskForge AI</h1>
                 <p class="slogan">Один эталон — десять вариантов. Без потери сложности.</p>
             </div>
-            <div class="session-info">
-                <span>🔑 Сессия: <span id="sessionIdDisplay">...</span></span>
-                <span>📊 Лимит: <span id="rateLimitDisplay">30</span> запросов/час</span>
-                <button id="newSessionBtn" class="btn-small">🔄 Новая сессия</button>
+            <div class="user-info" id="userInfo">
+                <div id="authButtons">
+                    <button id="loginBtn" class="login-btn">🔑 Войти</button>
+                </div>
+                <div id="userPanel" style="display: none;">
+                    <span class="user-greeting">👤 Привет, <span id="usernameDisplay"></span>!</span>
+                    <span class="limit-badge">📊 <span id="rateLimitDisplay">30</span>/час</span>
+                    <button id="logoutBtn" class="logout-btn">🚪 Выйти</button>
+                </div>
             </div>
         </header>
 
@@ -29,8 +57,8 @@
                 <div class="upload-area" id="uploadArea">
                     <div class="upload-icon">📁</div>
                     <p>Перетащите файл сюда или кликните для выбора</p>
-                    <p class="upload-hint">Поддерживаемые форматы: TXT, PDF, DOCX, PNG, JPG</p>
-                    <input type="file" id="fileInput" accept=".txt,.pdf,.docx,.png,.jpg,.jpeg" hidden>
+                    <p class="upload-hint">Поддерживаемые форматы: TXT, PDF, DOCX, PPTX, PNG, JPG</p>
+                    <input type="file" id="fileInput" accept=".txt,.pdf,.docx,.pptx,.png,.jpg,.jpeg" hidden>
                     <button id="selectFileBtn" class="btn">Выбрать файл</button>
                 </div>
                 <div class="or-divider">или</div>
@@ -45,6 +73,7 @@
                 <h2>⚙️ Шаг 2: Настройте параметры</h2>
                 
                 <div class="settings-grid">
+                    <!-- Первая колонка -->
                     <div class="setting">
                         <label>Количество вариантов (2-10):</label>
                         <input type="number" id="numVariants" min="2" max="10" value="4">
@@ -75,9 +104,9 @@
                         </div>
                     </div>
                     
-                    <!-- Целевой класс -->
+                    <!-- Вторая колонка -->
                     <div class="setting">
-                        <label>🎓 Целевой класс (опционально):</label>
+                        <label>🎓 Класс:</label>
                         <select id="targetGrade">
                             <option value="">Автоопределение</option>
                             <option value="5">5 класс</option>
@@ -89,7 +118,7 @@
                             <option value="11">11 класс</option>
                         </select>
                     </div>
-                    
+
                     <div class="setting">
                         <label>Пресеты:</label>
                         <div class="preset-buttons">
@@ -98,24 +127,58 @@
                             <button type="button" class="preset-btn" data-preset="full">🚀 Полный</button>
                         </div>
                     </div>
-                    
+
                     <div class="setting">
-                        <label>Запретить изменение (опционально):</label>
-                        <input type="text" id="forbiddenParts" placeholder="Например: имя 'Мария', город 'Москва'">
+                        <label>📋 Тип задания:</label>
+                        <select id="taskType">
+                            <option value="">Автоопределение</option>
+                            <option value="calculation">Задача</option>
+                            <option value="test">Тест</option>
+                            <option value="open_question">Открытый вопрос</option>
+                        </select>
                     </div>
                 </div>
+
+                    
+                    <!-- Третья колонка -->
+                    <div class="setting">
+                        <label>⚡ Что нельзя менять? (имена, города, даты...)</label>
+                        <textarea id="forbiddenParts" rows="3" placeholder="Например: имя 'Мария', город 'Москва'"></textarea>
+                    </div>
+                    
+
+
                 
-                <button id="generateBtn" class="btn btn-primary">🚀 Сгенерировать варианты</button>
+                <button id="generateBtn" class="btn btn-primary">🔍 Анализировать задание</button>
                 <button id="backToUploadBtn" class="btn-secondary" style="margin-left: 10px;">← Назад</button>
             </section>
 
-            <!-- Шаг 3: Анализ структуры  -->
+            <!-- Шаг 3: Анализ структуры -->
             <section class="card step-card" id="stepAnalysis" style="display: none;">
                 <h2>🔍 Анализ структуры задания</h2>
-                <div id="structureAnalysisContainer" class="structure-analysis"></div>
-                <div class="navigation-buttons">
+                <div id="structureAnalysisContainer" class="structure-analysis math"></div>
+                
+                <!-- ✅ НОВЫЙ БЛОК С КОММЕНТАРИЕМ -->
+                <div class="comment-section" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #e0e0e0;">
+                    <label for="generationComment" style="font-weight: 600; display: block; margin-bottom: 8px;">
+                        ✏️ Уточнение для генерации (необязательно)
+                    </label>
+                    <textarea 
+                        id="generationComment" 
+                        maxlength="200" 
+                        rows="3" 
+                        placeholder="Например: сделай варианты про космос, не меняй имя 'Мария', ориентируйся на 7 класс..."
+                        style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px; font-family: inherit; resize: vertical;"
+                    ></textarea>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 5px;">
+                        <span style="font-size: 12px; color: #666;">💡 Пример: "класс 7", "не менять Петю", "про спорт"</span>
+                        <span id="commentCounter" style="font-size: 12px; color: #666;">0/200 символов</span>
+                    </div>
+                </div>
+                
+                <div class="navigation-buttons" style="margin-top: 20px;">
                     <button id="backToSettingsFromAnalysisBtn" class="btn-secondary">← Назад к настройкам</button>
-                    <button id="proceedToGenerateBtn" class="btn-primary">Продолжить генерацию →</button>
+                    <button id="proceedToGenerateBtn" class="btn-primary">✅ Всё верно, сгенерировать варианты</button>
                 </div>
             </section>
 
@@ -123,32 +186,26 @@
             <section class="card step-card" id="step3" style="display: none;">
                 <h2>📋 Результаты генерации</h2>
                 
-                <!-- Анализ сложности -->
-                <div class="difficulty-analysis" id="difficultyAnalysis"></div>
-                
-                <!-- Валидация и ответы -->
-                <div class="validation-section" id="validationSection" style="display: none;">
-                    <h3>✅ Проверка вариантов</h3>
-                    <div id="validationResult" class="validation-result"></div>
-                    <div id="answersSection" class="answers-section" style="display: none;">
-                        <h4>📝 Ответы для учителя</h4>
-                        <div id="answersContainer" class="answers-container"></div>
-                    </div>
-                </div>
-                
                 <div class="variants-toolbar">
                     <button id="exportPdfBtn" class="btn-small">📄 Экспорт PDF</button>
                     <button id="exportDocxBtn" class="btn-small">📝 Экспорт DOCX</button>
+                    <label style="margin-left: 15px; display: inline-flex; align-items: center; gap: 5px;">
+                        <input type="checkbox" id="includeAnswersCheckbox"> 
+                        🔑 С ответами учителя
+                    </label>
                 </div>
                 
                 <div class="variants-container" id="variantsContainer"></div>
+                
+                <div class="validation-section" id="validationSection" style="display: none;">
+                    <div id="validationResult" class="validation-result"></div>
+                </div>
                 
                 <div class="navigation-buttons">
                     <button id="backToAnalysisBtn" class="btn-secondary">← Назад к анализу</button>
                     <button id="newTaskBtn" class="btn">➕ Новое задание</button>
                 </div>
             </section>
-
             <!-- Шаг 5: Библиотека заданий -->
             <section class="card step-card" id="step4" style="display: none;">
                 <h2>📚 Библиотека заданий</h2>
@@ -157,7 +214,6 @@
             </section>
         </main>
 
-        <!-- Футер с навигацией -->
         <footer>
             <div class="nav-links">
                 <button class="nav-btn" data-step="1">📝 Новое задание</button>
@@ -174,8 +230,34 @@
             <textarea id="editTextarea" rows="15"></textarea>
             <div class="modal-buttons">
                 <button id="saveEditBtn" class="btn-primary">Сохранить</button>
-                <button id="regenerateVariantBtn" class="btn-secondary">🔄 Перегенерировать</button>
                 <button id="cancelEditBtn" class="btn">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно авторизации -->
+    <div id="authModal" class="modal" style="display: none;">
+        <div class="modal-content auth-modal">
+            <span class="close">&times;</span>
+            <div class="auth-header">
+                <div class="auth-icon" id="authIcon">🔐</div>
+                <h2 id="authModalTitle">Вход</h2>
+                <p id="authSubtitle" class="auth-subtitle">Войдите в свой аккаунт</p>
+            </div>
+            
+            <div id="authForm">
+                <div class="form-group">
+                    <label>👤 Имя пользователя</label>
+                    <input type="text" id="authUsername" placeholder="от 3 до 50 символов">
+                </div>
+                <div class="form-group">
+                    <label>🔒 Пароль</label>
+                    <input type="password" id="authPassword" placeholder="от 6 символов">
+                </div>
+                <div id="authError" class="error-message" style="display: none;"></div>
+                
+                <button id="authSubmitBtn" class="auth-submit-btn">Войти</button>
+                <button id="authToggleBtn" class="auth-toggle-btn">Нет аккаунта? Зарегистрироваться</button>
             </div>
         </div>
     </div>
